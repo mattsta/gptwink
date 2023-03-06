@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "gptwink"
+version = "0.1.0"
+description = "gptwink lives to serve"
+authors = ["Matt Stancliff <matt@genges.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+aiohttp = "^3.8.4"
+fire = "^0.5.0"
+orjson = "^3.8.7"
+python-dotenv = "^1.0.0"
+loguru = "^0.6.0"
+aiohttp-sse = "^2.1.0"
+ulid-py = "^1.1.0"
+prompt-toolkit = "^3.0.38"
+
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.0.1"
+
+[tool.poetry.scripts]
+gptwink = "gptwink.gptwink:cmd"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
