@@ -3,13 +3,14 @@ from __future__ import annotations
 import orjson
 import aiohttp
 import asyncio
+from aiohttp_sse_client import client as sse_client  # type: ignore
 
 from loguru import logger
 from typing import Literal, TypeAlias, Final, Iterator
 
 import ulid
 import pathlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Name some ugly types for multiple reuse
 Role: TypeAlias = Literal["system", "user", "assistant"]
@@ -29,7 +30,7 @@ class GPTwink:
     """
 
     # BYO-Key
-    key: str
+    key: str = field(repr=False)
 
     # BYO-Session
     session: aiohttp.ClientSession
@@ -75,12 +76,71 @@ class GPTwink:
         formatted = [dict(role=role, content=content) for role, content in rc]
         req = dict(model=self.model, messages=formatted)
 
+        # "stream" implies live console output for now. This could technically take a better
+        # callback mechanism, but we're rapidly iterating here.
+        if self.stream:
+            # So this technically works, but it:
+            #  - doesn't include the regular metadata for usage (even at the end), so
+            #    we can't keep our "used tokens" counter running.
+            #  - It also doesn't generate the regular formats we expect, so if we use this,
+            #    we have to accumulate the results in a kinda ugly way which breaks our
+            #    abstraction layers...
+            async with sse_client.EventSource(
+                self.api,
+                dict(method="POST"),  # required
+                session=self.session,
+                json=req | apiargs | dict(stream=True),
+                headers=self.auth,
+            ) as es:
+                try:
+                    tokcount = 0
+                    toks: list[str] = []
+                    async for ev in es:
+                        # logger.info("msg: {}", ev)
+                        if ev.data == "[DONE]":
+                            # yer done!
+                            # it's so nice of thier API to make the field JSON _except_ for the final message,
+                            # so we can't just always parse the field. good job everybody.
+                            print("\n")
+                            answerstream = dict(
+                                usage=dict(stream_generated_tokens=tokcount),
+                                choices=[
+                                    dict(
+                                        message=dict(
+                                            role="assistant", content="".join(toks)
+                                        )
+                                    )
+                                ],
+                            )
+                            return Answer(self, answerstream, rc, apiargs)  # type: ignore
+
+                        # 'ev' looks something like:
+                        # MessageEvent(type=None, message='', data='{"id":"chatcmpl-XXXXXXXXXXXXX","object":"chat.completion.chunk","created":1678162501,"model":"gpt-3.5-turbo-0301","choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":null}]}', origin='https://api.openai.com', last_event_id='')
+                        # MessageEvent(type=None, message='', data='{"id":"chatcmpl-XXXXXXXXXXXXX","object":"chat.completion.chunk","created":1678161812,"model":"gpt-3.5-turbo-0301","choices":[{"delta":{"content":"Lorem"},"index":0,"finish_reason":null}]}', origin='https://api.openai.com', last_event_id='')
+                        data = orjson.loads(ev.data)
+                        # lovely data format (vomit)
+                        token = data["choices"][0]["delta"].get("content")
+
+                        if token:
+                            # we're hacking the print here because we want it "live"
+                            if tokcount == 0:
+                                print("assistant> ", end="", flush=True)
+
+                            tokcount += 1
+                            toks.append(token)
+                            print(token, end="", flush=True)
+                except:
+                    logger.warning("Connection error?")
+
+                # TODO: Better error handling here for the streaming case
+                assert None, "Message didn't end? Not enough tokens?"
+
         async with self.session.post(
             self.api, json=req | apiargs, headers=self.auth
         ) as got:
             answer = await got.json()
 
-        return Answer(self, answer, rc, apiargs)
+            return Answer(self, answer, rc, apiargs)
 
     async def again(self, previous: Answer, rc: RoleContent) -> Answer:
         """Extend current prompt with new output appended."""
@@ -203,8 +263,8 @@ class Salon:
             family = ...
 
 
-def cmd() -> None:
-    """Self-service UI"""
+def chatCLI(stream: bool = True) -> None:
+    """Self-service chat UI"""
     import dotenv
     import sys
     import os
@@ -226,7 +286,7 @@ def cmd() -> None:
         sys.exit(1)
 
     def status(got: Answer | None) -> HTML:
-        return HTML(got.answer["usage"] if got else "No status yet?")  # type: ignore
+        return HTML(got.answer.get("usage", "No usage calcualted when streaming...") if got else "No status yet?")  # type: ignore
 
     @logger.catch()
     async def looper() -> None:
@@ -236,21 +296,35 @@ def cmd() -> None:
         async with aiohttp.ClientSession() as client:
             assert KEY
             gpt = GPTwink(KEY, client)
-            try:
-                i = await session.prompt_async(
-                    "system> ", bottom_toolbar=f"Ready for first request..."
-                )
-                got: Answer | None = await gpt.chat([("system", i)])
+            while True:
+                try:
+                    i = await session.prompt_async(
+                        "system> ", bottom_toolbar=f"Ready for first request..."
+                    )
 
-                assert got
-                print("assistant>", *[m["content"] for m in got.messages()])
-            except (EOFError, KeyboardInterrupt):
-                logger.warning("Goodbye for now! You didn't even do anything!")
-                return
+                    if not i.strip():
+                        continue
+
+                    got: Answer | None = await gpt.chat([("system", i)])
+                    break
+
+                    assert got
+                    print("assistant>", *[m["content"] for m in got.messages()])
+                except EOFError:
+                    logger.warning("Goodbye for now! You didn't even do anything!")
+                    return
+                except KeyboardInterrupt:
+                    pass
+                except:
+                    logger.exception("come again?")
 
             while True:
                 try:
                     i = await session.prompt_async("user> ", bottom_toolbar=status(got))
+
+                    # ignore empty lines
+                    if not i.strip():
+                        continue
 
                     assert got
                     got = await got.again([("user", i)])
@@ -259,7 +333,14 @@ def cmd() -> None:
                         print("No current session has no remaining contunity! Failing.")
                         return
 
-                    print("\nassistant>", *[m["content"] for m in got.messages()], "\n")
+                    # only print full result of not "live / streaming" because if we streamed
+                    # the result, we printed the live output in the network loop.
+                    if not got.gpt.stream:
+                        print(
+                            "\nassistant>",
+                            *[m["content"] for m in got.messages()],
+                            "\n",
+                        )
                 except EOFError:
                     logger.warning("Goodbye for now!")
                     return
@@ -269,6 +350,12 @@ def cmd() -> None:
                     logger.exception("what now?")
 
     asyncio.run(looper())
+
+
+def cmd() -> None:
+    import fire
+
+    fire.Fire(chatCLI)
 
 
 if __name__ == "__main__":
